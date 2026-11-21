@@ -18,14 +18,19 @@ from .schemas import (
     FieldFailure,
     FieldRule,
     RecordFailure,
+    ReviewMeta,
     RuleSet,
     UniqueFailure,
-    UniqueRule,
     ValidationReport,
     ValidationSummary,
 )
 
 _MISSING = object()
+
+# 复核豁免只允许一种情形：赠品金额字段 amount_cents 取值为整数 0 时，
+# 被 min 下界规则判定失败。其他字段/规则/取值一律不得豁免。
+EXEMPT_FIELD = "amount_cents"
+EXEMPT_RULE = "min"
 
 
 def _is_blank(value: Any) -> bool:
@@ -223,9 +228,98 @@ def _check_batch_rules(
 def validate_batch(
     batch_id: str, schema_version: str, records: list[dict[str, Any]], rules: RuleSet
 ) -> ValidationReport:
+    """普通提交的全量校验，不做任何豁免。"""
     record_failures = _check_field_rules(rules, records)
     unique_failures = _check_unique_rules(rules, records)
+    return _build_report(
+        batch_id=batch_id,
+        schema_version=schema_version,
+        records=records,
+        rules=rules,
+        record_failures=record_failures,
+        unique_failures=unique_failures,
+        review=None,
+    )
 
+
+def is_exemptable_min_failure(
+    record: dict[str, Any], field_failures: dict[str, list[FieldFailure]]
+) -> bool:
+    """判断某行是否满足豁免条件：amount_cents 为整数 0 且存在 min 失败。
+
+    - 必须是严格的 ``int`` 且值为 0；``bool`` 与浮点 ``0.0`` 均不符合；
+    - 报告中必须确实存在 ``amount_cents`` 字段的 ``min`` 规则失败。
+    """
+    value = record.get(EXEMPT_FIELD)
+    if isinstance(value, bool) or not isinstance(value, int) or value != 0:
+        return False
+    failures = field_failures.get(EXEMPT_FIELD, [])
+    return any(f.rule == EXEMPT_RULE for f in failures)
+
+
+def validate_batch_review(
+    batch_id: str,
+    schema_version: str,
+    records: list[dict[str, Any]],
+    rules: RuleSet,
+    source_batch_id: str,
+    exempted_indexes: list[int],
+) -> ValidationReport:
+    """复核校验：仅剔除豁免行 amount_cents=0 的 min 失败，其余错误原样保留。
+
+    调用方（service 层）负责保证每个豁免行在原报告中确实存在可豁免的
+    min 失败；本函数会再次防御性检查，避免绕过前置条件。
+    """
+    exempted = set(exempted_indexes)
+    full_record_failures = _check_field_rules(rules, records)
+    unique_failures = _check_unique_rules(rules, records)
+
+    remaining_failures: list[RecordFailure] = []
+    for rf in full_record_failures:
+        if rf.record_index not in exempted:
+            remaining_failures.append(rf)
+            continue
+        record = records[rf.record_index]
+        if not is_exemptable_min_failure(record, rf.field_failures):
+            # 前置校验本应拦截；走到这里说明状态不一致，保守起见不豁免
+            remaining_failures.append(rf)
+            continue
+        kept = {
+            field: [f for f in failures if not (field == EXEMPT_FIELD and f.rule == EXEMPT_RULE)]
+            for field, failures in rf.field_failures.items()
+        }
+        kept = {field: failures for field, failures in kept.items() if failures}
+        if kept:
+            remaining_failures.append(
+                RecordFailure(record_index=rf.record_index, field_failures=kept)
+            )
+
+    review = ReviewMeta(
+        source_batch_id=source_batch_id,
+        exempted_record_indexes=list(exempted_indexes),
+    )
+    return _build_report(
+        batch_id=batch_id,
+        schema_version=schema_version,
+        records=records,
+        rules=rules,
+        record_failures=remaining_failures,
+        unique_failures=unique_failures,
+        review=review,
+    )
+
+
+def _build_report(
+    *,
+    batch_id: str,
+    schema_version: str,
+    records: list[dict[str, Any]],
+    rules: RuleSet,
+    record_failures: list[RecordFailure],
+    unique_failures: list[UniqueFailure],
+    review: ReviewMeta | None,
+) -> ValidationReport:
+    """汇总失败记录、批次阈值并组装报告（普通提交与复核共用）。"""
     # 涉及唯一性冲突的记录同样计入失败记录
     unique_record_indexes = {
         idx for uf in unique_failures for idx in uf.record_indexes
@@ -266,4 +360,5 @@ def validate_batch(
         record_failures=record_failures,
         unique_failures=unique_failures,
         batch_failures=batch_failures,
+        review=review,
     )

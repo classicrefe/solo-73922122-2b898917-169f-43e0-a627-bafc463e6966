@@ -44,12 +44,35 @@ def _sqlite_pragmas(dbapi_connection, _connection_record):  # noqa: ANN001
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 
+# 旧版本 submissions 表缺少复核功能所需列；这里做幂等的轻量补列迁移，
+# 避免已在运行的环境（如持久化 Docker 卷中的旧库）升级后缺列报错。
+_ADDED_COLUMNS: dict[str, str] = {
+    "kind": "ALTER TABLE submissions ADD COLUMN kind VARCHAR(16) NOT NULL DEFAULT 'SUBMISSION'",
+    "payload_json": "ALTER TABLE submissions ADD COLUMN payload_json TEXT",
+    "source_batch_id": "ALTER TABLE submissions ADD COLUMN source_batch_id VARCHAR(128)",
+    "exempted_indexes_json": "ALTER TABLE submissions ADD COLUMN exempted_indexes_json TEXT",
+}
+
+
+def _migrate_submissions() -> None:
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    if "submissions" not in inspector.get_table_names():
+        return
+    existing = {col["name"] for col in inspector.get_columns("submissions")}
+    with engine.begin() as conn:
+        for column, ddl in _ADDED_COLUMNS.items():
+            if column not in existing:
+                conn.execute(text(ddl))
+
+
 def init_db() -> None:
-    """建表（幂等）。"""
+    """建表（幂等）并对旧库执行补列迁移。"""
     from . import models  # noqa: F401  确保模型已注册
 
     Base.metadata.create_all(bind=engine)
-
+    _migrate_submissions()
 
 def get_db() -> Generator[Session, None, None]:
     db = SessionLocal()

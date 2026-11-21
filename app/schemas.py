@@ -1,7 +1,7 @@
 """请求 / 响应 Pydantic 模型。"""
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -67,6 +67,33 @@ class SubmissionRequest(BaseModel):
     rules: RuleSet
 
 
+class ReviewRequest(BaseModel):
+    """质控员复核请求：对原失败批次中的零金额下界失败申请豁免后重新校验。"""
+
+    source_batch_id: str = Field(min_length=1, max_length=128, description="原失败批号")
+    batch_id: str = Field(min_length=1, max_length=128, description="复核后的新批号")
+    schema_version: str = Field(min_length=1, max_length=64)
+    records: list[dict[str, Any]] = Field(
+        default_factory=list, description="原始记录，必须与首次提交逐字节等价"
+    )
+    rules: RuleSet
+    exempted_record_indexes: list[Annotated[int, Field(ge=0)]] = Field(
+        default_factory=list, description="已批准豁免的原行号列表"
+    )
+
+    @model_validator(mode="after")
+    def _dedupe_indexes(self) -> "ReviewRequest":
+        # 去重并保持稳定顺序；集合语义用于幂等键与豁免计算
+        seen: set[int] = set()
+        deduped: list[int] = []
+        for idx in self.exempted_record_indexes:
+            if idx not in seen:
+                seen.add(idx)
+                deduped.append(idx)
+        self.exempted_record_indexes = deduped
+        return self
+
+
 # ---------------------------------------------------------------------------
 # 校验报告
 # ---------------------------------------------------------------------------
@@ -95,6 +122,18 @@ class BatchFailure(BaseModel):
     message: str
 
 
+class ReviewMeta(BaseModel):
+    """复核报告的来源溯源信息；普通提交的报告不含该字段。
+
+    被豁免的失败固定为 ``amount_cents`` 取值整数 0 时触发的 ``min`` 下界失败，
+    因此这里只需注明来源批号与豁免行号集合。
+    """
+
+    kind: Literal["REVIEW"] = "REVIEW"
+    source_batch_id: str
+    exempted_record_indexes: list[int]
+
+
 class ValidationSummary(BaseModel):
     total_records: int
     passed_records: int
@@ -113,6 +152,9 @@ class ValidationReport(BaseModel):
     record_failures: list[RecordFailure] = Field(default_factory=list)
     unique_failures: list[UniqueFailure] = Field(default_factory=list)
     batch_failures: list[BatchFailure] = Field(default_factory=list)
+    review: ReviewMeta | None = Field(
+        default=None, description="复核产生的报告在此注明来源批号与豁免行；普通提交为 null"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -123,10 +165,16 @@ class ValidationReport(BaseModel):
 class SubmissionResponse(BaseModel):
     batch_id: str
     schema_version: str
+    kind: Literal["SUBMISSION", "REVIEW"] = Field(
+        default="SUBMISSION", description="SUBMISSION=普通提交，REVIEW=质控复核"
+    )
     status: Literal["PASSED", "FAILED"]
     replayed: bool = Field(description="是否为重复提交的幂等重放结果")
     registered: bool
     report: ValidationReport
+    review: ReviewMeta | None = Field(
+        default=None, description="复核请求的来源批号与豁免行；普通提交为 null"
+    )
 
 
 class BatchRecordOut(BaseModel):

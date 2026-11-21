@@ -13,16 +13,19 @@ from .schemas import (
     BatchSummaryOut,
     HealthOut,
     RegisteredBatchOut,
+    ReviewRequest,
     SubmissionRequest,
     SubmissionResponse,
     ValidationReport,
 )
 from .services import (
     IdempotencyConflict,
+    ReviewError,
     get_registered_batch,
     get_report,
     get_submission,
     list_registered_batches,
+    review_batch,
     ruleset_snapshot,
     submit_batch,
 )
@@ -53,6 +56,25 @@ def submit(req: SubmissionRequest, db: Session = Depends(get_db)) -> SubmissionR
                 "与首次提交不一致；同一批次版本的请求体必须保持一致"
             ),
         )
+
+
+@router.post(
+    "/batches/review",
+    response_model=SubmissionResponse,
+    tags=["batches"],
+    status_code=status.HTTP_200_OK,
+    summary="质控复核：对失败批次豁免零金额 min 失败后以新批号重新校验",
+    responses={
+        404: {"description": "来源批号不存在或不是普通提交"},
+        409: {"description": "新批号已被内容不同的普通提交/复核占用"},
+        422: {"description": "原始记录与首次提交不符、来源未失败或豁免行不满足条件"},
+    },
+)
+def review(req: ReviewRequest, db: Session = Depends(get_db)) -> SubmissionResponse:
+    try:
+        return review_batch(db, req)
+    except ReviewError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
 
 
 @router.get(

@@ -1,7 +1,6 @@
 {
   "description": "数据质量闸门示例提交载荷，可直接 POST 到 /batches/submit",
-  "examples": [
-    {
+  "examples": [    {
       "name": "valid_orders_batch",
       "expect": "PASSED —— 批次通过并登记",
       "payload": {
@@ -132,6 +131,98 @@
           }
         }
       }
+    }
+  ],
+  "review_examples": [
+    {
+      "name": "gift_zero_amount_review",
+      "description": "赠品 amount_cents=0（整数）触发 min 下界失败导致整批拒收；质控员复核豁免这两行后，按剩余错误重算并通过，以新批号登记",
+      "steps": [
+        {
+          "step": 1,
+          "method": "POST",
+          "path": "/batches/submit",
+          "expect": "FAILED —— 行 1、3 的赠品金额 0 触发 min 失败，失败率 0.5 超过阈值 0，整批拒收且不可读",
+          "payload": {
+            "batch_id": "demo-gift-0001",
+            "schema_version": "order-schema/v3.0",
+            "records": [
+              {"order_id": "ORD-7001", "amount_cents": 19950},
+              {"order_id": "ORD-7002", "amount_cents": 0},
+              {"order_id": "ORD-7003", "amount_cents": 4200},
+              {"order_id": "ORD-7004", "amount_cents": 0}
+            ],
+            "rules": {
+              "field_rules": {
+                "order_id": [
+                  {"type": "required"},
+                  {"type": "regex", "pattern": "^ORD-\\d{4}$"}
+                ],
+                "amount_cents": [
+                  {"type": "required"},
+                  {"type": "type", "value": "integer"},
+                  {"type": "min", "min": 1}
+                ]
+              },
+              "unique_rules": [{"fields": ["order_id"]}],
+              "batch_rules": {
+                "max_failure_rate": 0.0,
+                "min_record_count": 1,
+                "max_record_count": 100
+              }
+            }
+          }
+        },
+        {
+          "step": 2,
+          "method": "POST",
+          "path": "/batches/review",
+          "expect": "PASSED —— 豁免行 1、3 amount_cents 整数 0 的 min 失败后无剩余错误，以新批号登记整批原始记录，报告注明来源批号与豁免行",
+          "payload": {
+            "source_batch_id": "demo-gift-0001",
+            "batch_id": "demo-gift-0001-reviewed",
+            "schema_version": "order-schema/v3.0",
+            "records": [
+              {"order_id": "ORD-7001", "amount_cents": 19950},
+              {"order_id": "ORD-7002", "amount_cents": 0},
+              {"order_id": "ORD-7003", "amount_cents": 4200},
+              {"order_id": "ORD-7004", "amount_cents": 0}
+            ],
+            "rules": {
+              "field_rules": {
+                "order_id": [
+                  {"type": "required"},
+                  {"type": "regex", "pattern": "^ORD-\\d{4}$"}
+                ],
+                "amount_cents": [
+                  {"type": "required"},
+                  {"type": "type", "value": "integer"},
+                  {"type": "min", "min": 1}
+                ]
+              },
+              "unique_rules": [{"fields": ["order_id"]}],
+              "batch_rules": {
+                "max_failure_rate": 0.0,
+                "min_record_count": 1,
+                "max_record_count": 100
+              }
+            },
+            "exempted_record_indexes": [1, 3]
+          }
+        },
+        {
+          "step": 3,
+          "method": "GET",
+          "path": "/batches/demo-gift-0001-reviewed",
+          "expect": "200 —— 下游可读取复核通过的新批号整批记录（含赠品行）"
+        },
+        {
+          "step": 4,
+          "method": "GET",
+          "path": "/batches/demo-gift-0001",
+          "expect": "404 —— 原拒收批次仍不可读；其报告仍可通过 /submissions/demo-gift-0001 查询"
+        }
+      ]
     }
   ]
 }
